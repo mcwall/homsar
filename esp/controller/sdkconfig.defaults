@@ -1,0 +1,31 @@
+# Bluetooth: NimBLE only. NimBLE uses roughly 100 kB less RAM than Bluedroid
+# and this device never needs Bluetooth Classic.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# Peripheral/broadcaster only — the controller advertises and is connected to,
+# it never scans or initiates.
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# HID over GATT. esp_hid's NimBLE backend is compiled only when the HID service
+# is enabled, and it registers one service instance with an input and an output
+# report.
+CONFIG_BT_NIMBLE_HID_SERVICE=y
+CONFIG_BT_NIMBLE_SVC_HID_MAX_INSTANCES=1
+CONFIG_BT_NIMBLE_SVC_HID_MAX_RPTS=3
+
+# Device Information Service characteristics that esp_hid populates from
+# esp_hid_device_config_t.
+CONFIG_BT_NIMBLE_SVC_DIS_PNP_ID=y
+CONFIG_BT_NIMBLE_SVC_DIS_MANUFACTURER_NAME=y
+CONFIG_BT_NIMBLE_SVC_DIS_SERIAL_NUMBER=y
+
+# Keep bonds across reboots so a paired host reconnects on its own.
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+
+# The BLE stack does not fit in the default 1 MB app partition.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
