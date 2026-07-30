@@ -1,0 +1,571 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<!-- Home Assistant serves /local/ with Cache-Control: max-age=2678400 (31 days),
+     so a kiosk will happily show a month-old copy. These meta tags are a weak
+     hint only — browsers ignore http-equiv caching for the document itself and
+     they cannot override the real HTTP header. The reliable lever is a changed
+     URL: always load with a fresh ?v=N. The BUILD stamp in the HUD tells you
+     which copy you actually got. -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>ADS-B SCOPE</title>
+<style>
+  /* ---------------------------------------------------------------
+     GREEN-PHOSPHOR RADAR SCOPE  —  portrait kiosk build
+     Top: scope.  Bottom: the N nearest contacts.
+  ----------------------------------------------------------------*/
+  :root{
+    --bg:#000;
+    /* ===== PHOSPHOR COLOUR — single source of truth =====
+       The canvas reads this same variable at boot, so the page and the radar
+       can never drift apart. Change it here and everything follows; 255,45,45
+       gives a red scope, which doubles as a quick cache-sync test. */
+    --green-rgb:0,255,0;
+    --green:rgb(var(--green-rgb));            /* contacts, primary text */
+    --green-dim:rgba(var(--green-rgb),.29);   /* grid / faint structure */
+    --green-mid:rgba(var(--green-rgb),.48);   /* secondary lines        */
+    --white:#ffffff;        /* range rings, towered fields   */
+    --gray:#808080;         /* untowered fields              */
+    --amber:#ffb000;        /* alerts / no-link              */
+    --mono:"DejaVu Sans Mono","Consolas","Courier New",monospace;
+    --s:1;                  /* layout scale, set from JS     */
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--green);
+    font-family:var(--mono);overflow:hidden;-webkit-user-select:none;user-select:none;
+    cursor:none;} /* wall display — no cursor */
+
+  /* ---- stage: the portrait canvas everything lives on.
+         Sized (and optionally rotated) from JS so the layout stays
+         portrait even when the browser reports a landscape viewport. ---- */
+  #stage{position:fixed;left:0;top:0;width:100%;height:100%;transform-origin:0 0;
+    display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+
+  /* ---- top status bar ---- */
+  #hud-top{display:flex;align-items:center;gap:calc(10px*var(--s));
+    padding:calc(6px*var(--s)) calc(10px*var(--s));
+    font-size:calc(12px*var(--s));letter-spacing:.08em;
+    border-bottom:1px solid var(--green-dim);
+    text-transform:uppercase;flex:0 0 auto;white-space:nowrap}
+  #hud-top .spacer{flex:1 1 auto}
+  #hud-top b{color:var(--white);font-weight:400}
+  #link.ok{color:var(--green)}
+  #link.down{color:var(--amber);animation:blink 1s step-end infinite}
+  @keyframes blink{50%{opacity:.25}}
+
+  /* ---- scope ---- */
+  #scope-wrap{position:relative;flex:1 1 auto;min-height:0}
+  #scope{display:block;width:100%;height:100%}
+  /* rotating sweep — compositor-driven, respects reduced-motion */
+  #sweep{position:absolute;left:50%;top:50%;width:0;height:0;pointer-events:none}
+  /* The disc apex, the pivot and the gradient origin must all be the SAME
+     point — the element's top-left corner, which sits on the scope centre.
+     Rounding the bottom-right corner by 100% carves a quarter disc whose
+     apex is that top-left corner; `at 0% 0%` puts the gradient there too.
+     If these three disagree the wedge orbits the centre instead of pivoting. */
+  #sweep.on::before{content:"";position:absolute;left:0;top:0;
+    width:var(--r,300px);height:var(--r,300px);
+    transform-origin:0 0;border-radius:0 0 100% 0;
+    /* Rotation is clockwise, so the higher-angle edge is the LEADING one: the
+       beam is the hard bright edge at 42deg and the phosphor decay trails back
+       behind it to 0deg. Putting the bright stop first runs the fade ahead of
+       the beam instead of behind it. */
+    background:conic-gradient(from 90deg at 0% 0%,
+      transparent 0deg, rgba(var(--green-rgb),.06) 24deg,
+      rgba(var(--green-rgb),.28) 42deg, transparent 42deg, transparent 360deg);
+    animation:sweep 6s linear infinite}
+  @keyframes sweep{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion:reduce){#sweep.on::before{animation:none;opacity:.12}}
+
+  /* ---- touch controls (Echo Show has no keyboard) ---- */
+  #pad{position:absolute;right:calc(8px*var(--s));bottom:calc(8px*var(--s));
+    display:flex;gap:calc(6px*var(--s))}
+  #pad button{width:calc(38px*var(--s));height:calc(38px*var(--s));
+    background:#000;color:var(--green);border:1px solid var(--green-mid);
+    font-family:var(--mono);font-size:calc(16px*var(--s));line-height:1;
+    cursor:none;-webkit-tap-highlight-color:transparent}
+  #pad button:active{background:var(--green-dim)}
+
+  /* ---- nearest-traffic table ---- */
+  #traffic{flex:0 0 auto;border-top:1px solid var(--green-mid);
+    padding-bottom:calc(10px*var(--s))}
+  #traffic h2{margin:0;padding:calc(5px*var(--s)) calc(10px*var(--s));
+    font-size:calc(11px*var(--s));font-weight:400;letter-spacing:.14em;
+    color:var(--green-mid);text-transform:uppercase}
+  table{width:100%;border-collapse:collapse;table-layout:fixed;
+    font-size:calc(23px*var(--s))}
+  th,td{padding:calc(11px*var(--s)) calc(6px*var(--s));text-align:right;
+    white-space:nowrap;overflow:hidden}
+  th:first-child,td:first-child{padding-left:calc(10px*var(--s))}
+  th:nth-child(1),td:nth-child(1),th:nth-child(2),td:nth-child(2){text-align:left}
+  th:last-child,td:last-child{padding-right:calc(10px*var(--s))}
+  thead th{color:var(--green-mid);font-weight:400;letter-spacing:.1em;
+    text-transform:uppercase;font-size:calc(10px*var(--s));
+    border-bottom:1px solid var(--green-dim);padding-bottom:calc(3px*var(--s))}
+  tbody tr{border-bottom:1px solid var(--green-dim)}
+  tbody tr:last-child{border-bottom:0}
+  tbody td{color:var(--green)}
+  td.rank{color:var(--green-mid);font-size:calc(14px*var(--s));padding-right:0}
+  td.flt{color:var(--white)}
+  td.type{color:var(--green-mid)}
+  #traffic .empty{padding:calc(26px*var(--s));text-align:center;color:var(--gray);
+    font-size:calc(13px*var(--s));letter-spacing:.1em}
+</style>
+
+<div id="stage">
+  <div id="hud-top">
+    <span>CONTACTS <b id="count">0</b></span>
+    <span>RNG <b id="range">50</b>NM</span>
+    <span class="spacer"></span>
+    <span id="build"></span>
+    <span id="clock">--:--:--Z</span>
+    <span>LINK <b id="link" class="down">NO</b></span>
+  </div>
+
+  <div id="scope-wrap">
+    <canvas id="scope"></canvas>
+    <div id="sweep" class="on"></div>
+    <div id="pad">
+      <button id="btn-out" aria-label="Zoom out">&minus;</button>
+      <button id="btn-in" aria-label="Zoom in">+</button>
+    </div>
+  </div>
+
+  <section id="traffic">
+    <h2>Nearest Traffic</h2>
+    <table>
+      <colgroup><col style="width:6%"><col style="width:29%"><col style="width:21%"><col style="width:23%"><col style="width:21%"></colgroup>
+      <thead><tr><th></th><th>Flight</th><th>Type</th><th>Alt</th><th>Dist</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </section>
+</div>
+
+<script>
+/* ================================================================
+   CONFIG
+   ================================================================*/
+const CONFIG = {
+  // Receiver location — scope centre, north-up. (from /data/receiver.json)
+  RECEIVER_LAT: 40.092818,
+  RECEIVER_LON: -82.897004,
+
+  // readsb / tar1090 feed. Sends Access-Control-Allow-Origin:* so it is
+  // fetchable cross-origin — but a page served over HTTPS cannot read an
+  // http:// feed (mixed content). Serve this page over plain http.
+  DATA_URL: "http://192.168.50.15:8080/data/aircraft.json",
+
+  UPDATE_INTERVAL_MS: 10000,      // feed poll rate
+  MAX_RANGE_NM: 50,               // contacts beyond this are ignored entirely
+  RANGE_STEPS_NM: [5,10,20,30,40,50],
+  RANGE_DEFAULT_NM: 50,
+  TOP_N: 3,                       // rows in the nearest-traffic table
+  MAX_POS_AGE_S: 60,              // drop contacts whose position is staler
+  MAX_TRACK_POINTS: 8,            // trail length (8 polls = 80s of history)
+  LABEL_MAX_RANGE_NM: 40,         // above this only the top-N get labels
+  DEMO_FALLBACK: false,           // synthesise traffic when the feed is down
+
+  // Screen rotation, degrees clockwise: 0 | 90 | 270.
+  // The Echo Show reports a landscape viewport even when stood on end, so
+  // the portrait layout has to be spun to match. Override live with ?rot=N —
+  // use 270 if the display comes out upside down, 0 for a desktop browser.
+  ROTATE: 90,
+
+  // Reference fields. [lat, lon, tier] — tier 1 = towered/major, drawn at
+  // every range; tier 0 = smaller field, drawn only when zoomed in.
+  AIRPORTS: {
+    CMH:[39.9980,-82.8919,1], LCK:[39.8138,-82.9278,1], OSU:[40.0798,-83.0730,1],
+    TZR:[39.9014,-83.1370,1], DAY:[39.9024,-84.2194,1], ILN:[39.4279,-83.7921,1],
+    MFD:[40.8214,-82.5166,1], CAK:[40.9161,-81.4422,1], AOH:[40.7071,-84.0267,1],
+    FDY:[41.0135,-83.6687,1], LUK:[39.1033,-84.4186,1], TOL:[41.5868,-83.8078,1],
+    DLZ:[40.2799,-83.1153,0], MRT:[40.2246,-83.3517,0], VTA:[40.0233,-82.4620,0],
+    LHQ:[39.7558,-82.6573,0], UYF:[39.9331,-83.4622,0], MNN:[40.6161,-83.0635,0],
+    ZZV:[39.9444,-81.8921,0], CDI:[39.9750,-81.5772,0], BJJ:[40.8730,-81.8880,0],
+  },
+};
+
+/* ================================================================
+   STATE
+   ================================================================*/
+const S = {
+  rangeNm: CONFIG.RANGE_DEFAULT_NM,
+  scale: 1,                       // stage scale, kept in step with --s
+  labels: true,
+  sweep: true,
+  linkOk: false,
+  lastGood: 0,                    // Date.now() of the last successful poll
+  contacts: new Map(),            // hex -> {lat,lon,alt,gs,dist,brg,flight,type,trk,track[]}
+  top: [],                        // the TOP_N nearest, nearest first
+};
+
+/* ================================================================
+   HELPERS
+   ================================================================*/
+const $ = id => document.getElementById(id);
+const D2R = Math.PI/180;
+const R_EARTH_NM = 3440.065;
+const FONT = '"DejaVu Sans Mono",Consolas,"Courier New",monospace';
+// Build stamp — shown in the HUD so a stale cached copy is obvious at a glance.
+const BUILD = "r9";
+// Phosphor colour comes from the --green-rgb custom property, so CSS and canvas
+// can never drift apart. G(a) builds a canvas fill/stroke at alpha a.
+const PHOS = (getComputedStyle(document.documentElement)
+  .getPropertyValue("--green-rgb") || "0,255,0").trim();
+const G = a => "rgba("+PHOS+","+a+")";
+// Candidate offsets for a rank badge, tried in order until one is clear.
+const BADGE_SLOTS = [[1,-1],[1,1],[-1,-1],[-1,1],[1.9,0],[0,-1.9],[-1.9,0],[0,1.9],
+                     [2.6,-2.6],[2.6,2.6],[-2.6,-2.6],[-2.6,2.6]];
+
+function haversineNm(la1,lo1,la2,lo2){
+  const dLa=(la2-la1)*D2R, dLo=(lo2-lo1)*D2R;
+  const a=Math.sin(dLa/2)**2+Math.cos(la1*D2R)*Math.cos(la2*D2R)*Math.sin(dLo/2)**2;
+  return 2*R_EARTH_NM*Math.asin(Math.min(1,Math.sqrt(a)));
+}
+function bearing(la1,lo1,la2,lo2){
+  const y=Math.sin((lo2-lo1)*D2R)*Math.cos(la2*D2R);
+  const x=Math.cos(la1*D2R)*Math.sin(la2*D2R)-Math.sin(la1*D2R)*Math.cos(la2*D2R)*Math.cos((lo2-lo1)*D2R);
+  return (Math.atan2(y,x)/D2R+360)%360;
+}
+// Fit a canvas to its box at device pixel ratio; returns {ctx,w,h} in CSS px.
+function fitCanvas(cv){
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  const w=cv.clientWidth, h=cv.clientHeight;
+  cv.width=Math.max(1,Math.round(w*dpr));
+  cv.height=Math.max(1,Math.round(h*dpr));
+  const ctx=cv.getContext("2d");
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx,w,h};
+}
+
+/* ================================================================
+   STAGE  —  portrait sizing + optional rotation
+   ================================================================*/
+function layout(){
+  const q=new URLSearchParams(location.search).get("rot");
+  const rot=((+(q!=null?q:CONFIG.ROTATE)||0)%360+360)%360;
+  const st=$("stage");
+  if(rot===90||rot===270){
+    // Landscape viewport, portrait content: swap the axes and spin the stage.
+    st.style.width=window.innerHeight+"px";
+    st.style.height=window.innerWidth+"px";
+    st.style.transform = rot===90 ? "rotate(90deg) translateY(-100%)"
+                                  : "rotate(-90deg) translateX(-100%)";
+  }else{
+    // Unrotated: let CSS 100%/100% fill the viewport exactly.
+    st.style.width=st.style.height=""; st.style.transform="none";
+  }
+  // Everything is sized for a 480x960 portrait screen; scale from there.
+  // offsetWidth/Height are the pre-transform border box, so they stay correct
+  // when rotated. Scale by whichever axis is tighter: driving it off width
+  // alone would double every font if the stage ever came out landscape (a
+  // missing rotation), inflating the table until it swallowed the scope.
+  const k=Math.min(st.offsetWidth/480, st.offsetHeight/960);
+  S.scale=k;
+  document.documentElement.style.setProperty("--s",k.toFixed(3));
+  render();
+}
+
+/* ================================================================
+   DATA
+   ================================================================*/
+async function poll(){
+  try{
+    const r=await fetch(CONFIG.DATA_URL,{cache:"no-store"});
+    if(!r.ok) throw new Error(r.status);
+    const j=await r.json();
+    ingest(j.aircraft||[]);
+    S.linkOk=true; S.lastGood=Date.now();
+  }catch(e){
+    S.linkOk=false;
+    if(CONFIG.DEMO_FALLBACK) demoTick();
+  }
+  render();
+}
+
+function ingest(list){
+  const seen=new Set();
+  for(const ac of list){
+    const lat=ac.lat, lon=ac.lon;
+    if(lat==null||lon==null) continue;
+    if(ac.seen_pos!=null && ac.seen_pos>CONFIG.MAX_POS_AGE_S) continue;
+
+    let alt=ac.alt_baro!=null?ac.alt_baro:ac.alt_geom;
+    if(alt==null) continue;
+    if(alt==="ground") alt=0;
+    alt=+alt; if(Number.isNaN(alt)) continue;
+
+    // readsb ships range/bearing from the receiver; trust it, else compute.
+    const dist=ac.r_dst!=null?+ac.r_dst:haversineNm(CONFIG.RECEIVER_LAT,CONFIG.RECEIVER_LON,lat,lon);
+    if(dist>CONFIG.MAX_RANGE_NM) continue;
+    const brg=ac.r_dir!=null?+ac.r_dir:bearing(CONFIG.RECEIVER_LAT,CONFIG.RECEIVER_LON,lat,lon);
+
+    const hex=ac.hex||("~"+lat+lon);
+    seen.add(hex);
+    const c=S.contacts.get(hex)||{track:[]};
+    Object.assign(c,{
+      lat,lon,alt,dist,brg,
+      gs:(ac.gs!=null&&ac.gs!=="")?+ac.gs:null,
+      flight:(ac.flight||"").trim()||(ac.r||"").trim()||hex.toUpperCase(),
+      type:(ac.t||"").trim()||"—",
+      trk:ac.track!=null?ac.track:(ac.mag_heading!=null?ac.mag_heading:(c.trk!=null?c.trk:null)),
+      onGnd:ac.alt_baro==="ground",
+    });
+    c.track.push([lat,lon]);
+    if(c.track.length>CONFIG.MAX_TRACK_POINTS) c.track=c.track.slice(-CONFIG.MAX_TRACK_POINTS);
+    S.contacts.set(hex,c);
+  }
+  for(const k of [...S.contacts.keys()]) if(!seen.has(k)) S.contacts.delete(k);
+  S.top=[...S.contacts.values()].sort((a,b)=>a.dist-b.dist).slice(0,CONFIG.TOP_N);
+}
+
+// ---- demo generator: a few moving contacts so the layout is previewable ----
+let demoFleet=null;
+function demoTick(){
+  if(!demoFleet){
+    demoFleet=[]; const r=()=>Math.random();
+    for(let i=0;i<12;i++){
+      const brg=r()*360, d=3+r()*(CONFIG.MAX_RANGE_NM-6);
+      demoFleet.push({hex:"DEMO"+i,
+        lat:CONFIG.RECEIVER_LAT+d/60*Math.cos(brg*D2R),
+        lon:CONFIG.RECEIVER_LON+d/60*Math.sin(brg*D2R)/Math.cos(CONFIG.RECEIVER_LAT*D2R),
+        hdg:r()*360, gs:120+Math.round(r()*380), alt:1500+Math.round(r()*36)*1000,
+        t:["B738","A320","C172","E75L","CRJ9","PC12"][i%6],
+        flight:["SWA","DAL","N","RPA","UAL","JBU"][i%6]+(100+Math.floor(r()*899))});
+    }
+  }
+  const dt=CONFIG.UPDATE_INTERVAL_MS/1000;
+  ingest(demoFleet.map(a=>{
+    const nm=a.gs*dt/3600;
+    a.lat+=nm/60*Math.cos(a.hdg*D2R);
+    a.lon+=nm/60*Math.sin(a.hdg*D2R)/Math.cos(CONFIG.RECEIVER_LAT*D2R);
+    if(haversineNm(CONFIG.RECEIVER_LAT,CONFIG.RECEIVER_LON,a.lat,a.lon)>CONFIG.MAX_RANGE_NM-8)
+      a.hdg=(a.hdg+180)%360;
+    return {hex:a.hex,lat:a.lat,lon:a.lon,alt_baro:a.alt,gs:a.gs,track:a.hdg,flight:a.flight,t:a.t};
+  }));
+}
+
+/* ================================================================
+   SCOPE RENDER
+   ================================================================*/
+function drawScope(){
+  const cv=$("scope"); const {ctx,w,h}=fitCanvas(cv);
+  const cx=w/2, cy=h/2, radius=Math.min(w,h)/2-16;
+  // Same scale as the DOM text, so canvas and page type never disagree.
+  const fs=Math.max(8,Math.round(11*S.scale));
+  ctx.clearRect(0,0,w,h);
+
+  const sw=$("sweep");
+  sw.style.setProperty("--r",radius+"px");
+  sw.style.left=cx+"px"; sw.style.top=cy+"px";
+
+  const pxPerNm=radius/S.rangeNm;
+  const project=(lat,lon)=>{
+    const nNm=(lat-CONFIG.RECEIVER_LAT)*60;
+    const eNm=(lon-CONFIG.RECEIVER_LON)*60*Math.cos(CONFIG.RECEIVER_LAT*D2R);
+    return [cx+eNm*pxPerNm, cy-nNm*pxPerNm];
+  };
+
+  // range rings, labelled at the 6 o'clock position
+  ctx.lineWidth=1; ctx.font=(fs-2)+"px "+FONT; ctx.textAlign="center";
+  for(let i=1;i<=5;i++){
+    const rr=radius*i/5, nm=Math.round(S.rangeNm*i/5);
+    ctx.strokeStyle="rgba(255,255,255,.42)";
+    ctx.beginPath(); ctx.arc(cx,cy,rr,0,7); ctx.stroke();
+    ctx.fillStyle="rgba(255,255,255,.6)"; ctx.fillText(nm,cx,cy+rr+fs);
+  }
+  // bearing ticks every 30deg + cardinals
+  ctx.strokeStyle=G(.35); ctx.fillStyle=G(.65);
+  for(let d=0;d<360;d+=30){
+    const a=(d-90)*D2R;
+    ctx.beginPath();
+    ctx.moveTo(cx+Math.cos(a)*(radius-7),cy+Math.sin(a)*(radius-7));
+    ctx.lineTo(cx+Math.cos(a)*radius,cy+Math.sin(a)*radius);
+    ctx.stroke();
+  }
+  ["N","E","S","W"].forEach((c,i)=>{
+    const a=(i*90-90)*D2R;
+    ctx.fillText(c,cx+Math.cos(a)*(radius-18),cy+Math.sin(a)*(radius-18)+fs/3);
+  });
+  // crosshair
+  ctx.strokeStyle=G(.16); ctx.beginPath();
+  ctx.moveTo(cx-radius,cy); ctx.lineTo(cx+radius,cy);
+  ctx.moveTo(cx,cy-radius); ctx.lineTo(cx,cy+radius); ctx.stroke();
+
+  // everything that moves is clipped to the scope circle
+  ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,radius,0,7); ctx.clip();
+
+  // reference fields — small ones only once zoomed in, to keep 100nm readable
+  ctx.font=(fs-1)+"px "+FONT; ctx.textAlign="left";
+  for(const [code,[la,lo,tier]] of Object.entries(CONFIG.AIRPORTS)){
+    if(!tier && S.rangeNm>CONFIG.LABEL_MAX_RANGE_NM) continue;
+    const [x,y]=project(la,lo);
+    ctx.strokeStyle=tier?"rgba(255,255,255,.75)":"rgba(128,128,128,.75)";
+    ctx.lineWidth=1.4;
+    ctx.beginPath();
+    ctx.moveTo(x,y-4); ctx.lineTo(x+4,y); ctx.lineTo(x,y+4); ctx.lineTo(x-4,y);
+    ctx.closePath(); ctx.stroke();
+    // dimmer than the diamond so fields sit behind traffic, not compete with it
+    ctx.fillStyle=tier?"rgba(255,255,255,.55)":"rgba(128,128,128,.55)";
+    ctx.fillText(code,x+7,y-2);
+  }
+
+  const showAll = S.labels && S.rangeNm<=CONFIG.LABEL_MAX_RANGE_NM;
+  const rankOf = new Map(S.top.map((c,i)=>[c,i+1]));
+  const badges = [];   // placed rank badges, so they can dodge each other
+
+  for(const c of S.contacts.values()){
+    const rank=rankOf.get(c);
+    // trail
+    if(c.track.length>1){
+      ctx.strokeStyle=rank?G(.8):G(.45);
+      ctx.lineWidth=1.3; ctx.setLineDash([2,4]);
+      ctx.beginPath();
+      c.track.forEach((p,i)=>{const [x,y]=project(p[0],p[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+    const [x,y]=project(c.lat,c.lon);
+    // heading vector
+    if(c.trk!=null){
+      const a=(c.trk-90)*D2R;
+      ctx.strokeStyle=G(.9); ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x+Math.cos(a)*11,y+Math.sin(a)*11); ctx.stroke();
+    }
+    // contact: nearest N are filled and ringed
+    ctx.strokeStyle=G(1); ctx.fillStyle=G(1); ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(x,y,3,0,7);
+    if(rank){
+      ctx.fill();
+      ctx.beginPath(); ctx.arc(x,y,7,0,7); ctx.stroke();
+    }else ctx.stroke();
+
+    if(rank&&!showAll){
+      // Zoomed out the nearest contacts sit almost on top of each other, so
+      // they get a numbered badge only — the table row carries the detail.
+      // Fan the badge around the dot until it clears the ones already placed.
+      const br=fs*.85;
+      let bx=x, by=y;
+      for(const [dx,dy] of BADGE_SLOTS){
+        bx=x+dx*(br+8); by=y+dy*(br+8);
+        if(badges.every(b=>Math.hypot(b[0]-bx,b[1]-by) > br*2.3)) break;
+      }
+      badges.push([bx,by]);
+      ctx.strokeStyle="rgba(255,255,255,.55)"; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(bx,by); ctx.stroke();
+      ctx.beginPath(); ctx.arc(bx,by,br,0,7);
+      ctx.fillStyle="#000"; ctx.fill();
+      ctx.strokeStyle="#ffffff"; ctx.stroke();
+      ctx.fillStyle="#ffffff"; ctx.font=fs+"px "+FONT;
+      ctx.textAlign="center"; ctx.textBaseline="middle";
+      ctx.fillText(rank,bx,by);
+      ctx.textAlign="left"; ctx.textBaseline="alphabetic";
+    }else if(rank||showAll){
+      ctx.font=fs+"px "+FONT; ctx.textAlign="left";
+      ctx.fillStyle=rank?"#ffffff":G(1);
+      ctx.fillText(rank?rank+" "+c.flight:c.flight,x+10,y-4);
+      ctx.fillStyle=G(.75); ctx.font=(fs-1)+"px "+FONT;
+      const alt=c.onGnd?"GND":Math.round(c.alt).toLocaleString()+"'";
+      ctx.fillText(alt+(c.gs!=null?"  "+Math.round(c.gs)+"kt":""),x+10,y+fs+1);
+    }
+  }
+  ctx.restore();
+
+  // receiver, point-up, at centre
+  ctx.strokeStyle="#ffffff"; ctx.fillStyle="#000"; ctx.lineWidth=1;
+  ctx.beginPath();
+  ctx.moveTo(cx,cy-7); ctx.lineTo(cx+6,cy+5); ctx.lineTo(cx-6,cy+5); ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  if(!S.linkOk){
+    const age=S.lastGood?Math.round((Date.now()-S.lastGood)/1000)+"S AGO":"NEVER";
+    ctx.fillStyle="#ffb000"; ctx.font=fs+"px "+FONT; ctx.textAlign="center";
+    ctx.fillText("NO FEED · LAST DATA "+age,cx,h-6);
+  }
+}
+
+/* ================================================================
+   NEAREST-TRAFFIC TABLE
+   ================================================================*/
+function drawTraffic(){
+  const tb=$("tbody");
+  if(!S.top.length){
+    tb.innerHTML='<tr><td colspan="5" class="empty">NO CONTACTS</td></tr>';
+    return;
+  }
+  tb.innerHTML=S.top.map((c,i)=>
+    `<tr><td class="rank">${i+1}</td>`+
+    `<td class="flt">${esc(c.flight)}</td>`+
+    `<td class="type">${esc(c.type)}</td>`+
+    `<td>${c.onGnd?"GND":Math.round(c.alt).toLocaleString()+"'"}</td>`+
+    `<td>${c.dist.toFixed(1)}<span style="color:var(--green-mid)">nm</span></td></tr>`
+  ).join("");
+}
+const esc=s=>String(s).replace(/[&<>]/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[m]));
+
+/* ================================================================
+   SHELL + INPUT
+   ================================================================*/
+function render(){
+  $("count").textContent=S.contacts.size;
+  $("range").textContent=S.rangeNm;
+  const lk=$("link");
+  lk.textContent=S.linkOk?"OK":"NO";
+  lk.className=S.linkOk?"ok":"down";
+  drawScope();
+  drawTraffic();
+}
+function clock(){
+  $("clock").textContent=new Date().toISOString().slice(11,19)+"Z";
+}
+function zoom(dir){
+  const steps=CONFIG.RANGE_STEPS_NM;
+  let i=steps.indexOf(S.rangeNm);
+  if(i<0) i=steps.indexOf(CONFIG.RANGE_DEFAULT_NM);
+  S.rangeNm=steps[Math.max(0,Math.min(steps.length-1,i+dir))];
+  render();
+}
+$("btn-in").addEventListener("click",()=>zoom(1));
+$("btn-out").addEventListener("click",()=>zoom(-1));
+
+/* Digit commands. The bluetooth controller presents itself as a keyboard and
+   sends plain digits, so the number row is the command surface: 1 and 2 are
+   zoom, 3-9 are reserved and deliberately swallowed (an unmapped key must not
+   fall through to the browser and, say, trigger quick-find on the kiosk). */
+const DIGIT_CMD = {
+  "1": () => zoom(-1),
+  "2": () => zoom(1),
+  "3": null, "4": null, "5": null, "6": null,
+  "7": null, "8": null, "9": null,
+};
+
+/* Capture phase: a keystroke is claimed here before anything else on the page
+   can stop it. */
+addEventListener("keydown",e=>{
+  if(e.key in DIGIT_CMD){
+    const cmd=DIGIT_CMD[e.key];
+    if(cmd) cmd();
+    e.preventDefault();
+    return;
+  }
+  switch(e.key){
+    case"+":case"=":case"ArrowUp":zoom(1);break;
+    case"-":case"_":case"ArrowDown":zoom(-1);break;
+    case"l":case"L":S.labels=!S.labels;render();break;
+    case"s":case"S":S.sweep=!S.sweep;$("sweep").classList.toggle("on",S.sweep);break;
+    default:return;
+  }
+  e.preventDefault();
+},{passive:false,capture:true});
+
+let rt;
+addEventListener("resize",()=>{clearTimeout(rt);rt=setTimeout(layout,120)});
+
+/* ================================================================
+   BOOT
+   ================================================================*/
+$("build").textContent=BUILD;
+clock(); setInterval(clock,1000);
+layout();
+poll(); setInterval(poll,CONFIG.UPDATE_INTERVAL_MS);
+</script>
